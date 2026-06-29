@@ -196,13 +196,19 @@ func NewUnifiedExecutor(
 		logger = zap.NewNop()
 	}
 
+	// Bug 9: MaxConcurrent==0 会导致无缓冲通道永久阻塞，兜底为合理默认值
+	maxConcurrent := config.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 10
+	}
+
 	executor := &UnifiedExecutor{
 		service:   service,
 		config:    config,
 		logger:    logger,
 		tracer:    otel.Tracer("unified-executor"),
 		metrics:   metrics,
-		semaphore: make(chan struct{}, config.MaxConcurrent),
+		semaphore: make(chan struct{}, maxConcurrent),
 	}
 
 	return executor
@@ -377,8 +383,11 @@ func (e *UnifiedExecutor) ExecuteBatch(
 	var wg sync.WaitGroup
 	for i, item := range items {
 		wg.Add(1)
+		// Bug 8: Shutdown 依赖 e.wg 跟踪所有 in-flight goroutine
+		e.wg.Add(1)
 		go func(idx int, item BatchItem) {
 			defer wg.Done()
+			defer e.wg.Done()
 
 			result, err := e.ExecuteWithIdempotency(ctx, item.Key, item.TTL, item.Fn)
 			results[idx] = BatchResult{
@@ -558,7 +567,10 @@ func (e *UnifiedExecutor) ExecuteAsync(
 ) <-chan AsyncResult {
 	resultChan := make(chan AsyncResult, 1)
 
+	// Bug 8: Shutdown 依赖 e.wg 跟踪所有 in-flight goroutine
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		defer close(resultChan)
 
 		result, err := e.ExecuteWithIdempotency(ctx, key, ttl, fn)
@@ -588,7 +600,11 @@ func (e *UnifiedExecutor) ExecuteWithCallback(
 	onSuccess func(result interface{}),
 	onError func(err error),
 ) {
+	// Bug 8: Shutdown 依赖 e.wg 跟踪所有 in-flight goroutine
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
+
 		result, err := e.ExecuteWithIdempotency(ctx, key, ttl, fn)
 		if err != nil {
 			if onError != nil {

@@ -61,16 +61,33 @@ func (m *DefaultMetricsCollector) RecordLatency(strategy IdempotencyStrategy, du
 	m.latency[string(strategy)] += duration
 }
 
-// GetStats 获取统计
+// GetStats 获取统计（返回深拷贝，避免锁释放后调用方与写入者竞争）
 func (m *DefaultMetricsCollector) GetStats() map[string]interface{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	hitsCopy := make(map[string]int64, len(m.hits))
+	for k, v := range m.hits {
+		hitsCopy[k] = v
+	}
+	missesCopy := make(map[string]int64, len(m.misses))
+	for k, v := range m.misses {
+		missesCopy[k] = v
+	}
+	errorsCopy := make(map[string]int64, len(m.errors))
+	for k, v := range m.errors {
+		errorsCopy[k] = v
+	}
+	latencyCopy := make(map[string]time.Duration, len(m.latency))
+	for k, v := range m.latency {
+		latencyCopy[k] = v
+	}
+
 	return map[string]interface{}{
-		"hits":    m.hits,
-		"misses":  m.misses,
-		"errors":  m.errors,
-		"latency": m.latency,
+		"hits":    hitsCopy,
+		"misses":  missesCopy,
+		"errors":  errorsCopy,
+		"latency": latencyCopy,
 	}
 }
 

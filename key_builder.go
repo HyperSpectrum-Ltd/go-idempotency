@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -376,6 +377,7 @@ func BuildKeyWithOptions(opts ...KeyBuilderOption) string {
 
 // KeyBuilderRegistry 键构建器注册表
 type KeyBuilderRegistry struct {
+	mu       sync.RWMutex
 	builders map[string]*UnifiedKeyBuilder
 }
 
@@ -388,37 +390,51 @@ func NewKeyBuilderRegistry() *KeyBuilderRegistry {
 
 // Register 注册构建器
 func (r *KeyBuilderRegistry) Register(name string, builder *UnifiedKeyBuilder) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.builders[name] = builder
 }
 
-// Get 获取构建器
+// Get 获取构建器（返回克隆，避免外部修改影响注册表内部状态）
 func (r *KeyBuilderRegistry) Get(name string) (*UnifiedKeyBuilder, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	builder, ok := r.builders[name]
-	return builder, ok
+	if !ok {
+		return nil, false
+	}
+	return builder.Clone(), true
 }
 
 // GetOrRegister 获取或注册构建器
 func (r *KeyBuilderRegistry) GetOrRegister(name string, builder *UnifiedKeyBuilder) *UnifiedKeyBuilder {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if existing, ok := r.builders[name]; ok {
-		return existing
+		return existing.Clone()
 	}
 	r.builders[name] = builder
-	return builder
+	return builder.Clone()
 }
 
 // Build 构建指定名称的键
 func (r *KeyBuilderRegistry) Build(name string) string {
-	if builder, ok := r.builders[name]; ok {
-		return builder.Build()
+	r.mu.RLock()
+	builder, ok := r.builders[name]
+	r.mu.RUnlock()
+	if !ok {
+		return ""
 	}
-	return ""
+	return builder.Build()
 }
 
-// All 获取所有构建器
+// All 获取所有构建器（返回克隆）
 func (r *KeyBuilderRegistry) All() map[string]*UnifiedKeyBuilder {
-	result := make(map[string]*UnifiedKeyBuilder)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make(map[string]*UnifiedKeyBuilder, len(r.builders))
 	for k, v := range r.builders {
-		result[k] = v
+		result[k] = v.Clone()
 	}
 	return result
 }
