@@ -14,10 +14,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// ExecutorConfig 执行器配置
+// ExecutorConfig 执行器配置。DefaultTTL/EnableMetrics/RetryDelay 与
+// IdempotencyConfig 共用 RuntimeConfig。
 type ExecutorConfig struct {
-	// DefaultTTL 默认过期时间
-	DefaultTTL time.Duration
+	RuntimeConfig
 
 	// MaxConcurrent 最大并发数
 	MaxConcurrent int
@@ -28,26 +28,22 @@ type ExecutorConfig struct {
 	// EnableTracing 是否启用追踪
 	EnableTracing bool
 
-	// EnableMetrics 是否启用指标
-	EnableMetrics bool
-
 	// RetryCount 重试次数
 	RetryCount int
-
-	// RetryDelay 重试延迟
-	RetryDelay time.Duration
 }
 
 // DefaultExecutorConfig 默认执行器配置
 func DefaultExecutorConfig() *ExecutorConfig {
 	return &ExecutorConfig{
-		DefaultTTL:    24 * time.Hour,
+		RuntimeConfig: RuntimeConfig{
+			DefaultTTL:    24 * time.Hour,
+			EnableMetrics: true,
+			RetryDelay:    100 * time.Millisecond,
+		},
 		MaxConcurrent: 100,
 		Timeout:       30 * time.Second,
 		EnableTracing: true,
-		EnableMetrics: true,
 		RetryCount:    0,
-		RetryDelay:    100 * time.Millisecond,
 	}
 }
 
@@ -214,7 +210,10 @@ func NewUnifiedExecutor(
 	return executor
 }
 
-// ExecuteWithIdempotency 使用幂等性执行
+// ExecuteWithIdempotency 使用幂等性执行。
+//
+// Deprecated: 使用 ExecuteWithOptions（ExecutionOptions{Key, TTL}），
+// 以便同时携带策略覆盖与回调。
 func (e *UnifiedExecutor) ExecuteWithIdempotency(
 	ctx context.Context,
 	key string,
@@ -228,7 +227,11 @@ func (e *UnifiedExecutor) ExecuteWithIdempotency(
 	return result.Result, nil
 }
 
-// ExecuteWithIdempotencyAndContext 使用幂等性和上下文执行
+// ExecuteWithIdempotencyAndContext 使用幂等性和上下文执行。
+//
+// Deprecated: 使用 ExecuteWithOptions；本方法等价于
+//
+//	ExecuteWithOptions(ctx, &ExecutionOptions{Key: key, TTL: ttl}, fn)
 func (e *UnifiedExecutor) ExecuteWithIdempotencyAndContext(
 	ctx context.Context,
 	key string,
@@ -236,52 +239,7 @@ func (e *UnifiedExecutor) ExecuteWithIdempotencyAndContext(
 	fn ExecutionFunc,
 	execCtx *ExecutionContext,
 ) (*ExecutionResult, error) {
-	// 创建追踪 span
-	ctx, span := e.tracer.Start(ctx, "UnifiedExecutor.Execute",
-		trace.WithAttributes(
-			attribute.String("key", key),
-			attribute.String("operation", "execute_with_idempotency")))
-	defer span.End()
-
-	// 设置超时
-	if e.config.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, e.config.Timeout)
-		defer cancel()
-	}
-
-	// 获取并发槽
-	select {
-	case e.semaphore <- struct{}{}:
-		defer func() { <-e.semaphore }()
-	case <-ctx.Done():
-		span.SetStatus(codes.Error, "context cancelled")
-		return nil, ctx.Err()
-	}
-
-	// 设置默认 TTL
-	if ttl == 0 {
-		ttl = e.config.DefaultTTL
-	}
-
-	// 执行
-	startTime := time.Now()
-	result, err := e.service.ExecuteWithIdempotencyAndResult(ctx, key, ttl, func() (interface{}, error) {
-		return e.executeWithRetry(ctx, fn, execCtx)
-	})
-
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
-		return nil, err
-	}
-
-	// 记录指标
-	if e.metrics != nil && e.config.EnableMetrics {
-		e.metrics.RecordLatency(e.service.config.Strategy, time.Since(startTime))
-	}
-
-	return result, nil
+	return e.executeWithOptions(ctx, &ExecutionOptions{Key: key, TTL: ttl}, fn, execCtx)
 }
 
 // executeWithRetry 带重试执行
@@ -334,15 +292,64 @@ func (e *UnifiedExecutor) isRetryableError(err error) bool {
 	return false
 }
 
-// ExecuteWithOptions 使用选项执行
+// ExecuteWithOptions 使用选项执行，是执行器的唯一幂等执行入口。
+//
+// 统一承担：追踪 span、执行超时、并发上限、重试与指标记录。
 func (e *UnifiedExecutor) ExecuteWithOptions(
 	ctx context.Context,
 	opts *ExecutionOptions,
 	fn ExecutionFunc,
 ) (*ExecutionResult, error) {
-	return e.service.ExecuteWithOptions(ctx, opts, func() (interface{}, error) {
-		return fn(ctx)
+	return e.executeWithOptions(ctx, opts, fn, nil)
+}
+
+func (e *UnifiedExecutor) executeWithOptions(
+	ctx context.Context,
+	opts *ExecutionOptions,
+	fn ExecutionFunc,
+	execCtx *ExecutionContext,
+) (*ExecutionResult, error) {
+	if opts == nil {
+		opts = &ExecutionOptions{}
+	}
+	if opts.TTL == 0 {
+		opts.TTL = e.config.DefaultTTL
+	}
+
+	ctx, span := e.tracer.Start(ctx, "UnifiedExecutor.Execute",
+		trace.WithAttributes(
+			attribute.String("key", opts.Key),
+			attribute.String("operation", "execute_with_idempotency")))
+	defer span.End()
+
+	if e.config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.config.Timeout)
+		defer cancel()
+	}
+
+	select {
+	case e.semaphore <- struct{}{}:
+		defer func() { <-e.semaphore }()
+	case <-ctx.Done():
+		span.SetStatus(codes.Error, "context cancelled")
+		return nil, ctx.Err()
+	}
+
+	startTime := time.Now()
+	result, err := e.service.ExecuteWithOptions(ctx, opts, func() (interface{}, error) {
+		return e.executeWithRetry(ctx, fn, execCtx)
 	})
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
+		return nil, err
+	}
+
+	if e.metrics != nil && e.config.EnableMetrics {
+		e.metrics.RecordLatency(e.service.config.Strategy, time.Since(startTime))
+	}
+	return result, nil
 }
 
 // Execute 执行（不使用幂等性）
@@ -416,7 +423,9 @@ type BatchResult struct {
 	Error error
 }
 
-// ExecuteParallel 并行执行
+// ExecuteParallel 并行执行。
+//
+// Deprecated: 对每个任务调用 Execute 并自行汇总。
 func (e *UnifiedExecutor) ExecuteParallel(
 	ctx context.Context,
 	fns map[string]ExecutionFunc,
@@ -445,7 +454,9 @@ func (e *UnifiedExecutor) ExecuteParallel(
 	return results
 }
 
-// ExecuteWithLock 使用分布式锁执行
+// ExecuteWithLock 使用分布式锁执行。
+//
+// Deprecated: 用 domainkit port.WithLock 包裹 Execute。
 func (e *UnifiedExecutor) ExecuteWithLock(
 	ctx context.Context,
 	lockKey string,
@@ -476,7 +487,9 @@ func (e *UnifiedExecutor) ExecuteWithLock(
 	return result, nil
 }
 
-// ExecuteWithLockAndIdempotency 使用分布式锁和幂等性执行
+// ExecuteWithLockAndIdempotency 使用分布式锁和幂等性执行。
+//
+// Deprecated: 用分布式锁包裹 ExecuteWithOptions。
 func (e *UnifiedExecutor) ExecuteWithLockAndIdempotency(
 	ctx context.Context,
 	key string,
@@ -546,7 +559,9 @@ func (e *UnifiedExecutor) ExecuteWithLockAndIdempotency(
 	return result, nil
 }
 
-// ExecuteWithTimeout 使用超时执行
+// ExecuteWithTimeout 使用超时执行。
+//
+// Deprecated: context.WithTimeout + Execute。
 func (e *UnifiedExecutor) ExecuteWithTimeout(
 	ctx context.Context,
 	timeout time.Duration,
@@ -558,7 +573,9 @@ func (e *UnifiedExecutor) ExecuteWithTimeout(
 	return e.Execute(ctx, fn)
 }
 
-// ExecuteAsync 异步执行
+// ExecuteAsync 异步执行。
+//
+// Deprecated: ExecuteWithOptions + 自行管理 goroutine/结果通道。
 func (e *UnifiedExecutor) ExecuteAsync(
 	ctx context.Context,
 	key string,
@@ -591,7 +608,9 @@ type AsyncResult struct {
 	Error error
 }
 
-// ExecuteWithCallback 带回调执行
+// ExecuteWithCallback 带回调执行。
+//
+// Deprecated: ExecuteWithOptions 的 OnHit/OnMiss/OnError 回调已覆盖该场景。
 func (e *UnifiedExecutor) ExecuteWithCallback(
 	ctx context.Context,
 	key string,

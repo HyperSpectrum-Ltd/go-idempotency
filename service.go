@@ -27,6 +27,45 @@ type UnifiedIdempotencyService struct {
 
 	// 本地缓存（用于减少远程调用）
 	localCache sync.Map
+
+	// keyLocks 是进程内按幂等键的互斥锁（GAP-068）。
+	// 无分布式锁时，两个并发请求会同时通过 check 并各自执行 fn，造成重复扣款/重复发信；
+	// 多副本场景仍由分布式锁或数据库唯一约束兜底，这里只保证单副本内串行。
+	keyLocksMu sync.Mutex
+	keyLocks   map[string]*keyLockEntry
+}
+
+// keyLockEntry 是单个幂等键的进程内锁与引用计数。
+type keyLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockKey 获取指定幂等键的进程内互斥锁，返回解锁函数。
+// 引用计数归零时移除条目，避免键空间无界增长。
+func (s *UnifiedIdempotencyService) lockKey(key string) func() {
+	s.keyLocksMu.Lock()
+	if s.keyLocks == nil {
+		s.keyLocks = make(map[string]*keyLockEntry)
+	}
+	entry, ok := s.keyLocks[key]
+	if !ok {
+		entry = &keyLockEntry{}
+		s.keyLocks[key] = entry
+	}
+	entry.refs++
+	s.keyLocksMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		s.keyLocksMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(s.keyLocks, key)
+		}
+		s.keyLocksMu.Unlock()
+	}
 }
 
 // NewUnifiedIdempotencyService 创建统一幂等性服务
@@ -54,6 +93,7 @@ func NewUnifiedIdempotencyService(
 		metrics:    metrics,
 		tracer:     otel.Tracer("idempotency-service"),
 		serializer: NewJSONSerializer(),
+		keyLocks:   make(map[string]*keyLockEntry),
 	}
 }
 
@@ -475,7 +515,10 @@ func (s *UnifiedIdempotencyService) Release(ctx context.Context, key string, loc
 	return nil
 }
 
-// ExecuteWithIdempotency 使用幂等性执行函数
+// ExecuteWithIdempotency 使用幂等性执行函数。
+//
+// Deprecated: 使用 ExecuteWithOptions（&ExecutionOptions{Key: key, TTL: ttl}），
+// 以便携带策略覆盖与回调。
 func (s *UnifiedIdempotencyService) ExecuteWithIdempotency(
 	ctx context.Context,
 	key string,
@@ -489,7 +532,9 @@ func (s *UnifiedIdempotencyService) ExecuteWithIdempotency(
 	return result.Result, nil
 }
 
-// ExecuteWithIdempotencyAndResult 使用幂等性执行函数并返回详细结果
+// ExecuteWithIdempotencyAndResult 使用幂等性执行函数并返回详细结果。
+//
+// Deprecated: 使用 ExecuteWithOptions（&ExecutionOptions{Key: key, TTL: ttl}）。
 func (s *UnifiedIdempotencyService) ExecuteWithIdempotencyAndResult(
 	ctx context.Context,
 	key string,
@@ -517,10 +562,16 @@ func (s *UnifiedIdempotencyService) executeWithIdempotencyAndResult(
 		ttl = s.config.DefaultTTL
 	}
 
-	// Bug 1: 当启用分布式锁且存在锁提供者时，主路径使用锁 + 双重检查
+	// Bug 1: 当启用分布式锁且存在锁提供者时，主路径使用锁 + 双重检查。
+	// 该路径保持 fail-fast：拿不到锁的并发请求返回 ErrDistributedLock。
 	if s.config.EnableDistributedLock && s.lock != nil {
 		return s.executeWithDistributedLock(ctx, key, ttl, fn, strategy, startTime)
 	}
+
+	// GAP-068：无分布式锁（或未配置锁提供者）时，单副本内按 key 串行，
+	// 避免并发请求同时通过 check 后各自执行 fn（重复扣款/重复发信）。
+	unlock := s.lockKey(key)
+	defer unlock()
 
 	return s.executeWithoutLock(ctx, key, ttl, fn, strategy, startTime)
 }
@@ -552,13 +603,24 @@ func (s *UnifiedIdempotencyService) executeWithDistributedLock(
 
 	// 双重检查：获取锁后再次检查幂等性
 	exists, cachedResult, checkErr := s.checkWithStrategy(ctx, key, strategy)
-	if checkErr != nil && !errors.Is(checkErr, ErrKeyExpired) && !errors.Is(checkErr, ErrProcessing) {
+	if checkErr != nil && !errors.Is(checkErr, ErrKeyExpired) &&
+		!errors.Is(checkErr, ErrProcessing) && !errors.Is(checkErr, ErrExecutionFailed) {
 		s.recordError(strategy, checkErr)
 		return nil, checkErr
 	}
 	// Bug 5: 正在处理中时不应重复执行
 	if errors.Is(checkErr, ErrProcessing) {
 		return nil, ErrProcessing
+	}
+	// GAP-068：失败记录允许重试，清理后按未命中继续执行。
+	if errors.Is(checkErr, ErrExecutionFailed) {
+		if s.db != nil {
+			if delErr := s.db.Delete(ctx, key); delErr != nil {
+				s.logger.Warn("failed to clear failed idempotency record",
+					zap.String("key", key), zap.Error(delErr))
+			}
+		}
+		exists, cachedResult, checkErr = false, nil, nil
 	}
 	if exists && !errors.Is(checkErr, ErrKeyExpired) {
 		s.logger.Info("idempotency key hit", zap.String("key", key))
@@ -628,7 +690,8 @@ func (s *UnifiedIdempotencyService) executeWithoutLock(
 ) (*ExecutionResult, error) {
 	// 检查幂等性
 	exists, cachedResult, err := s.checkWithStrategy(ctx, key, strategy)
-	if err != nil && !errors.Is(err, ErrKeyExpired) && !errors.Is(err, ErrProcessing) {
+	if err != nil && !errors.Is(err, ErrKeyExpired) &&
+		!errors.Is(err, ErrProcessing) && !errors.Is(err, ErrExecutionFailed) {
 		s.recordError(strategy, err)
 		return nil, err
 	}
@@ -636,6 +699,17 @@ func (s *UnifiedIdempotencyService) executeWithoutLock(
 	// Bug 5: 正在处理中时不应重复执行
 	if errors.Is(err, ErrProcessing) {
 		return nil, ErrProcessing
+	}
+
+	// GAP-068：失败记录允许重试，清理后按未命中继续执行。
+	if errors.Is(err, ErrExecutionFailed) {
+		if s.db != nil {
+			if delErr := s.db.Delete(ctx, key); delErr != nil {
+				s.logger.Warn("failed to clear failed idempotency record",
+					zap.String("key", key), zap.Error(delErr))
+			}
+		}
+		exists, cachedResult, err = false, nil, nil
 	}
 
 	if exists && !errors.Is(err, ErrKeyExpired) {

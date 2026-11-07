@@ -2,28 +2,34 @@ package idempotency
 
 import "time"
 
-// IdempotencyConfig 幂等性配置
-type IdempotencyConfig struct {
-	// Strategy 幂等性策略
-	Strategy IdempotencyStrategy `json:"strategy"`
-
+// RuntimeConfig 是服务与执行器共享的运行参数，避免两份配置重复定义
+// DefaultTTL/EnableMetrics/RetryDelay。
+type RuntimeConfig struct {
 	// DefaultTTL 默认过期时间
 	DefaultTTL time.Duration `json:"default_ttl"`
 
-	// CacheTTL 缓存过期时间（用于双写模式）
-	CacheTTL time.Duration `json:"cache_ttl"`
-
 	// EnableMetrics 是否启用指标收集
 	EnableMetrics bool `json:"enable_metrics"`
+
+	// RetryDelay 重试延迟
+	RetryDelay time.Duration `json:"retry_delay"`
+}
+
+// IdempotencyConfig 幂等性配置
+type IdempotencyConfig struct {
+	RuntimeConfig
+
+	// Strategy 幂等性策略
+	Strategy IdempotencyStrategy `json:"strategy"`
+
+	// CacheTTL 缓存过期时间（用于双写模式）
+	CacheTTL time.Duration `json:"cache_ttl"`
 
 	// KeyPrefix 键前缀
 	KeyPrefix string `json:"key_prefix"`
 
 	// MaxRetryCount 最大重试次数
 	MaxRetryCount int `json:"max_retry_count"`
-
-	// RetryDelay 重试延迟
-	RetryDelay time.Duration `json:"retry_delay"`
 
 	// LockTTL 分布式锁 TTL
 	LockTTL time.Duration `json:"lock_ttl"`
@@ -35,13 +41,15 @@ type IdempotencyConfig struct {
 // DefaultIdempotencyConfig 默认配置
 func DefaultIdempotencyConfig() *IdempotencyConfig {
 	return &IdempotencyConfig{
+		RuntimeConfig: RuntimeConfig{
+			DefaultTTL:    24 * time.Hour,
+			EnableMetrics: true,
+			RetryDelay:    100 * time.Millisecond,
+		},
 		Strategy:              StrategyCacheFirst,
-		DefaultTTL:            24 * time.Hour,
 		CacheTTL:              24 * time.Hour,
-		EnableMetrics:         true,
 		KeyPrefix:             "idempotency",
 		MaxRetryCount:         3,
-		RetryDelay:            100 * time.Millisecond,
 		LockTTL:               30 * time.Second,
 		EnableDistributedLock: true,
 	}

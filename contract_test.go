@@ -48,7 +48,10 @@ func (f *fakeLockProvider) WithLock(_ context.Context, key string, _ time.Durati
 // TestDistributedLockProvider_UsableAsDomainkitLock 证明 domainkit 的
 // port.WithLock 可直接驱动本模块的锁提供者，无需额外适配器。
 func TestIdempotencyConfig_MapsToDomainkitBackoff(t *testing.T) {
-	cfg := &IdempotencyConfig{MaxRetryCount: 3, RetryDelay: 100 * time.Millisecond}
+	cfg := &IdempotencyConfig{
+		RuntimeConfig: RuntimeConfig{RetryDelay: 100 * time.Millisecond},
+		MaxRetryCount: 3,
+	}
 	bp := cfg.BackoffPolicy()
 
 	if bp.MaxAttempts != 4 {

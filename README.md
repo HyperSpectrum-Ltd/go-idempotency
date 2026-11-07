@@ -77,21 +77,22 @@ func main() {
         nil,                                      // 指标收集器（可选）
     )
 
-    // 使用幂等性执行
+    // 使用幂等性执行（唯一 canonical 入口）
     ctx := context.Background()
-    result, err := service.ExecuteWithIdempotency(
+    result, err := service.ExecuteWithOptions(
         ctx,
-        "order:create:12345",                    // 幂等性键
-        24*time.Hour,                            // TTL
+        &idempotency.ExecutionOptions{
+            Key: "order:create:12345",
+            TTL: 24 * time.Hour,
+        },
         func() (interface{}, error) {
-            // 业务逻辑
             return createOrder("12345")
         },
     )
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println("Result:", result)
+    fmt.Println("Result:", result.Result, "hit:", result.IsHit)
 }
 ```
 
@@ -138,25 +139,21 @@ executor := idempotency.NewExecutorBuilder().
     WithLogger(logger).
     Build()
 
-// 使用幂等性执行
-result, err := executor.ExecuteWithIdempotency(
+// 使用幂等性执行（唯一 canonical 入口；含超时、并发上限、重试与指标）
+result, err := executor.ExecuteWithOptions(
     ctx,
-    "payment:process:67890",
-    24*time.Hour,
+    &idempotency.ExecutionOptions{
+        Key: "payment:process:67890",
+        TTL: 24 * time.Hour,
+    },
     func(ctx context.Context) (interface{}, error) {
         return processPayment("67890")
     },
 )
+fmt.Println(result.Result, result.IsHit)
 
-// 使用分布式锁执行
-result, err := executor.ExecuteWithLock(
-    ctx,
-    "lock:payment:67890",
-    30*time.Second,
-    func(ctx context.Context) (interface{}, error) {
-        return processPayment("67890")
-    },
-)
+// 需要分布式锁时，用 go-domainkit 的 port.WithLock 包裹：
+// err = port.WithLock(ctx, lock, "payment:67890", 30*time.Second, func() error { ... })
 
 // 批量执行
 results := executor.ExecuteBatch(ctx, []idempotency.BatchItem{
@@ -164,6 +161,16 @@ results := executor.ExecuteBatch(ctx, []idempotency.BatchItem{
     {Key: "order:2", TTL: time.Hour, Fn: func(ctx context.Context) (interface{}, error) { return processOrder("2") }},
 })
 ```
+
+## 并发与失败语义
+
+- **启用分布式锁**（`EnableDistributedLock=true` 且提供 `DistributedLockProvider`）：按 fail-fast 语义，
+  并发同 key 请求中拿不到锁的返回 `ErrDistributedLock`，由调用方决定重试。
+- **未启用分布式锁**（或未配置锁提供者）：服务在单副本内按 key 加进程内互斥锁，
+  同一 key 的并发请求串行执行，只有第一个真正执行业务函数，其余读取已保存结果。
+  多副本场景仍需启用分布式锁或数据库唯一约束兜底。
+- **失败记录可重试**：业务函数返回错误时会写入 `RecordStatusFailed` 记录（便于审计），
+  但该记录**不视为终态**；下一次同 key 请求会清理失败记录并重新执行。
 
 ## 幂等性策略
 
