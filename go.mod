@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/HyperSpectrum-Ltd/go-domainkit v0.0.0
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -19,3 +20,5 @@ require (
 	go.uber.org/multierr v1.10.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/HyperSpectrum-Ltd/go-domainkit => ../go-domainkit
